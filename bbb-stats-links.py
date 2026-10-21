@@ -11,6 +11,7 @@
   - Корректная таймзона
   - Аккордеон для таблицы участников
   - Клиентские поиск / фильтры / сортировка без перезагрузки
+  - Кнопка копирования списка участников (без модераторов)
   - CLI-режим для очистки старых сессий (--prune)
 """
 
@@ -35,15 +36,14 @@ TIMEZONE = ZoneInfo("Europe/Moscow")
 SKIP_FILE = Path("/usr/local/etc/bbb-stats-skip.txt")
 
 # Пороги отсева мусора
-MIN_DURATION_SEC = 60        # сессии короче минуты не показываем
-MIN_USERS = 2                # только модератор — не показываем
-SKIP_NAME_SUBSTRINGS = (     # если подстрока есть в названии — не показываем
+MIN_DURATION_SEC = 60
+MIN_USERS = 2
+SKIP_NAME_SUBSTRINGS = (
     "test", "тест", "demo", "демо", "проверка", "check",
 )
 
 
 def ts_to_str(ms) -> str:
-    """Timestamp в мс -> 'DD.MM.YYYY HH:MM' в настроенной таймзоне."""
     if not ms:
         return "—"
     try:
@@ -53,7 +53,6 @@ def ts_to_str(ms) -> str:
 
 
 def duration_str(start_ms, end_ms) -> str:
-    """Длительность в формате 'Чч Мм'."""
     if not start_ms or not end_ms:
         return "—"
     try:
@@ -69,7 +68,6 @@ def duration_str(start_ms, end_ms) -> str:
 
 
 def duration_seconds(start_ms, end_ms) -> int:
-    """Длительность в секундах (0 если не посчитать)."""
     if not start_ms or not end_ms:
         return 0
     try:
@@ -80,7 +78,6 @@ def duration_seconds(start_ms, end_ms) -> int:
 
 
 def find_data_file(session_dir: Path) -> Path | None:
-    """Ищет learning_dashboard_data.json внутри подпапки-токена."""
     try:
         for sub in session_dir.iterdir():
             if sub.is_dir():
@@ -93,7 +90,6 @@ def find_data_file(session_dir: Path) -> Path | None:
 
 
 def load_skip_list() -> set[str]:
-    """Читает список meeting_id для скрытия."""
     if not SKIP_FILE.is_file():
         return set()
     try:
@@ -107,7 +103,6 @@ def load_skip_list() -> set[str]:
 
 
 def collect_user_stats(users: dict) -> list[dict]:
-    """Извлекает статистику по каждому участнику."""
     result = []
     for user in users.values():
         registered = None
@@ -141,8 +136,13 @@ def collect_user_stats(users: dict) -> list[dict]:
     return result
 
 
+def build_attendees_list(users: list[dict]) -> str:
+    """Список участников БЕЗ модераторов, по одному на строку."""
+    names = [u["name"] for u in users if not u["is_moderator"]]
+    return "\n".join(names)
+
+
 def is_junk(session: dict) -> bool:
-    """Проверяет, является ли сессия мусорной."""
     if session["disabled"]:
         return True
     if session["users_count"] < MIN_USERS:
@@ -156,9 +156,7 @@ def is_junk(session: dict) -> bool:
 
 
 def collect_sessions() -> list[dict]:
-    """Собирает все сессии со статистикой, отфильтровывая мусор."""
     sessions: list[dict] = []
-
     if not DASHBOARD_DIR.is_dir():
         return sessions
 
@@ -186,7 +184,6 @@ def collect_sessions() -> list[dict]:
         created = data.get("createdOn")
         ended = data.get("endedOn")
 
-        # Фолбэк на mtime папки, если createdOn отсутствует
         if not created:
             try:
                 created = int(session_dir.stat().st_mtime * 1000)
@@ -200,6 +197,8 @@ def collect_sessions() -> list[dict]:
             f"?meeting={meeting_id}&report={token}&lang=ru"
         )
 
+        users_list = collect_user_stats(users)
+
         session = {
             "meeting_id": meeting_id,
             "name": data.get("name") or meeting_id,
@@ -212,7 +211,9 @@ def collect_sessions() -> list[dict]:
             "screenshares_count": len(data.get("screenshares", [])),
             "slides_count": len(data.get("presentationSlides", [])),
             "disabled": data.get("learningDashboardDisabled", False),
-            "users": collect_user_stats(users),
+            "users": users_list,
+            "attendees_text": build_attendees_list(users_list),
+            "attendees_count": sum(1 for u in users_list if not u["is_moderator"]),
             "url": url,
             "_created_ms": created or 0,
             "_duration_sec": duration_seconds(created, ended),
@@ -223,13 +224,11 @@ def collect_sessions() -> list[dict]:
 
         sessions.append(session)
 
-    # Сортируем по дате создания, свежие сверху
     sessions.sort(key=lambda s: s["_created_ms"], reverse=True)
     return sessions
 
 
 def render_users_table(users: list[dict]) -> str:
-    """Таблица участников."""
     if not users:
         return "<p><em>Участников нет.</em></p>"
 
@@ -279,13 +278,16 @@ def render_users_table(users: list[dict]) -> str:
 
 
 def render_html(sessions: list[dict]) -> str:
-    """Формирует HTML-страницу."""
     cards = ""
-    for s in sessions:
+    for idx, s in enumerate(sessions):
         disabled_badge = (
             '<span class="badge warn">Дашборд отключён</span>'
             if s["disabled"] else ""
         )
+
+        # Текст для копирования кладём в <textarea> (скрыт), чтобы не ломать HTML
+        # экранированием переводов строк
+        attendees_escaped = html.escape(s["attendees_text"])
 
         cards += f"""
         <div class="card"
@@ -307,14 +309,25 @@ def render_html(sessions: list[dict]) -> str:
                 <div class="meeting-id"><strong>Meeting ID:</strong> <code>{html.escape(s['meeting_id'])}</code></div>
             </div>
 
-            <p>
+            <div class="actions">
                 <a class="button" href="{html.escape(s['url'])}" target="_blank">
                     Открыть интерактивный дашборд
                 </a>
                 <button class="btn-hide" data-mid="{html.escape(s['meeting_id'])}" type="button">
                     Скрыть из отчёта
                 </button>
-            </p>
+            </div>
+
+            <div class="copy-row">
+                <button class="btn-copy-attendees"
+                        type="button"
+                        data-target="attendees-{idx}"
+                        data-count="{s['attendees_count']}">
+                    Скопировать список участников ({s['attendees_count']})
+                </button>
+                <span class="copy-hint" id="hint-{idx}"></span>
+            </div>
+            <textarea id="attendees-{idx}" class="attendees-data" readonly>{attendees_escaped}</textarea>
 
             <details>
                 <summary>Участники ({s['users_count']})</summary>
@@ -388,6 +401,13 @@ def render_html(sessions: list[dict]) -> str:
         }}
         .meeting-id {{ grid-column: 1 / -1; }}
         .meeting-id code {{ font-size: 0.85em; color: #555; }}
+
+        .actions {{
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+            margin-bottom: 0.75rem;
+        }}
         .button {{
             display: inline-block;
             background: #0066cc;
@@ -410,6 +430,35 @@ def render_html(sessions: list[dict]) -> str:
             font-size: 0.9em;
         }}
         .btn-hide:hover {{ background: #fff2f4; }}
+
+        .copy-row {{
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+            align-items: center;
+            margin-bottom: 0.75rem;
+        }}
+        .btn-copy-attendees {{
+            background: #1a7f37;
+            color: #fff;
+            border: none;
+            padding: 0.5rem 1rem;
+            border-radius: 5px;
+            cursor: pointer;
+            font-weight: 500;
+        }}
+        .btn-copy-attendees:hover {{ background: #145f2a; }}
+        .btn-copy-attendees.copied {{ background: #2e7d32; }}
+        .copy-hint {{ color: #1a7f37; font-size: 0.9em; }}
+        .attendees-data {{
+            position: absolute;
+            left: -9999px;
+            top: -9999px;
+            width: 1px;
+            height: 1px;
+            opacity: 0;
+            pointer-events: none;
+        }}
 
         details {{ margin-top: 1rem; }}
         details summary {{
@@ -495,7 +544,6 @@ def render_html(sessions: list[dict]) -> str:
 
         function parseDateInput(v) {{
             if (!v) return null;
-            // v = YYYY-MM-DD; считаем границу суток в локальной зоне
             const d = new Date(v + 'T00:00:00');
             return isNaN(d.getTime()) ? null : d.getTime();
         }}
@@ -505,7 +553,6 @@ def render_html(sessions: list[dict]) -> str:
             const minUsers = parseInt(minUsersEl.value, 10) || 0;
             const from = parseDateInput(fromEl.value);
             const to = parseDateInput(toEl.value);
-            // конец "по" — конец суток
             const toEnd = to !== null ? to + 24 * 3600 * 1000 - 1 : null;
 
             let visible = 0;
@@ -525,7 +572,6 @@ def render_html(sessions: list[dict]) -> str:
                 if (ok) visible++;
             }});
 
-            // Сортировка
             const mode = sortEl.value;
             const sorted = cards.slice().sort((a, b) => {{
                 const ta = parseInt(a.dataset.ts, 10) || 0;
@@ -555,7 +601,7 @@ def render_html(sessions: list[dict]) -> str:
         sortEl.addEventListener('change', apply);
         apply();
 
-        // Кнопка "Скрыть из отчёта" — копирует meeting_id для вставки в skip-файл
+        // Кнопка "Скрыть из отчёта"
         document.querySelectorAll('.btn-hide').forEach(btn => {{
             btn.addEventListener('click', async () => {{
                 const mid = btn.dataset.mid;
@@ -565,6 +611,59 @@ def render_html(sessions: list[dict]) -> str:
                     setTimeout(() => {{ btn.textContent = 'Скрыть из отчёта'; }}, 2000);
                 }} catch (e) {{
                     prompt('Скопируйте meeting_id и добавьте в skip-файл:', mid);
+                }}
+            }});
+        }});
+
+        // Кнопка "Скопировать список участников"
+        document.querySelectorAll('.btn-copy-attendees').forEach(btn => {{
+            btn.addEventListener('click', async () => {{
+                const targetId = btn.dataset.target;
+                const count = btn.dataset.count;
+                const ta = document.getElementById(targetId);
+                const hintId = targetId.replace('attendees-', 'hint-');
+                const hint = document.getElementById(hintId);
+
+                if (!ta) return;
+                const text = ta.value;
+
+                if (!text || count === '0') {{
+                    if (hint) {{
+                        hint.textContent = 'Нет участников без модераторов';
+                        hint.style.color = '#b00020';
+                        setTimeout(() => {{ hint.textContent = ''; }}, 2500);
+                    }}
+                    return;
+                }}
+
+                try {{
+                    await navigator.clipboard.writeText(text);
+                    btn.classList.add('copied');
+                    const original = btn.textContent;
+                    btn.textContent = 'Скопировано ✓';
+                    if (hint) hint.textContent = '';
+                    setTimeout(() => {{
+                        btn.classList.remove('copied');
+                        btn.textContent = original;
+                    }}, 2000);
+                }} catch (e) {{
+                    // Фолбэк: выделяем textarea и предлагаем скопировать вручную
+                    ta.style.position = 'static';
+                    ta.style.width = '100%';
+                    ta.style.height = 'auto';
+                    ta.style.opacity = '1';
+                    ta.style.pointerEvents = 'auto';
+                    ta.select();
+                    try {{
+                        document.execCommand('copy');
+                        btn.textContent = 'Скопировано ✓';
+                        setTimeout(() => {{ btn.textContent = original; }}, 2000);
+                    }} catch (_) {{
+                        if (hint) {{
+                            hint.textContent = 'Скопируйте вручную из поля ниже';
+                            hint.style.color = '#b00020';
+                        }}
+                    }}
                 }}
             }});
         }});
@@ -578,7 +677,6 @@ def render_html(sessions: list[dict]) -> str:
 # --- CLI для очистки старых сессий ---
 
 def prune_sessions(older_than_days: int, apply: bool) -> None:
-    """Удаляет директории сессий старше N дней."""
     if not DASHBOARD_DIR.is_dir():
         print(f"Директория не найдена: {DASHBOARD_DIR}", file=sys.stderr)
         return
